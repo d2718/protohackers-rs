@@ -1,0 +1,6 @@
+{"method":"isPrime","number":12}
+{"method":"isPrime","number":97}
+{"method":"isPrime","number":-14.2}
+{ "method": "isPrime", "number": 91 }
+{ "method": "isPrime", "frog": "blue", "number": 23 }
+{ "meth": "not good" }
