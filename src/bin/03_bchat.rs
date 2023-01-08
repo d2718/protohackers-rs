@@ -22,6 +22,7 @@ const LAGGED_TEXT: &[u8] = b"Your connection has lagged and dropped messages.\n"
 const WELCOME_TEXT: &[u8] = b"Welcome. Please enter the name you'd like to use.\n";
 const REJECT_TEXT: &[u8] = b"Your name must consist of one or more alphanumeric characters.\n";
 
+/// Messages from the `Room` to `Client`s.
 #[derive(Clone, Debug)]
 enum Msg {
     /// Deliver to every user but `id`.
@@ -30,6 +31,7 @@ enum Msg {
     One{ id: usize, text: String },
 }
 
+/// `Client` actions to report to the `Room`.
 #[derive(Clone, Debug)]
 enum Evt {
     Text{ id: usize, text: String },
@@ -55,6 +57,7 @@ impl Room {
         }
     }
 
+    /// Generate a message listing all the current occupants.
     fn name_list(&self) -> String {
         let names: Vec<&str> = self.users.iter()
             .map(|(_, name)| name.as_str())
@@ -63,6 +66,13 @@ impl Room {
         format!("* Also here: {}\n", &names.join(", "))
     }
 
+    /// Run the room.\
+    /// 
+    /// There is a lot of `.unwrap()`ping going on here, but
+    ///   * If `self.blow.send()` returns an error, we have serious problems,
+    ///     so let's just die.
+    ///   * The requested key should _always_ be in `self.users`; if it's
+    ///     not, something way weird has happened, so again, let's die.
     pub async fn run(&mut self) {
         while let Some(evt) = self.suck.recv().await {
             log::info!("room: {:?}", &evt);
@@ -92,6 +102,9 @@ impl Room {
                         text: format!("* {} leaves.", &name),
                         id: id,
                     };
+                    // If no one is left in the `Room`, this will return an
+                    // error, so we are satisfy the compiler here by
+                    // "handling" it.
                     let _ = self.blow.send(msg);
                 },
             }
@@ -99,60 +112,80 @@ impl Room {
     }
 }
 
+/// Handles to a connected client's socket, internal buffer, and user id.
 struct Client {
     id: usize,
-    sndr: WriteHalf<TcpStream>,
-    rcvr: BufReader<ReadHalf<TcpStream>>,
+    suck: BufReader<ReadHalf<TcpStream>>,
+    blow: WriteHalf<TcpStream>,
+    buff: Vec<u8>,
 }
 
-impl Into<TcpStream> for Client {
-    fn into(self) -> TcpStream {
-        self.rcvr.into_inner().unsplit(self.sndr)
-    }
-}
-
+// Possible results of calling `Client::get_line()`.
 enum ClientResult {
     Line(String),
-    Last(String),
     Eof,
     Err(String),
 }
 
 impl Client {
-    pub fn new(s: TcpStream, id: usize) -> Client {
-        let (rh, wh) = tokio::io::split(s);
+    pub fn new(sock: TcpStream, id: usize) -> Client {
+        let (r, w) = tokio::io::split(sock);
         Client {
             id,
-            sndr: wh,
-            rcvr: BufReader::new(rh),
+            suck: BufReader::new(r),
+            blow: w,
+            buff: Vec::new(),
         }
     }
 
+    /// Attempt to read a single line of text from the socket.
     pub async fn get_line(&mut self) -> ClientResult {
-        let mut buff = String::new();
-        let res = self.rcvr.read_line(&mut buff).await;
+        let res = self.suck.read_until(b'\n', &mut self.buff).await;
         log::debug!("Client {} read_line() result: {:?}", self.id, &res);
         match res {
             Ok(0) => ClientResult::Eof,
             Ok(_) => {
-                if *buff.as_bytes().last().unwrap() == b'\n' {
-                    log::debug!("Client {} read_line() returns {:?}", self.id, &buff);
-                    ClientResult::Line(buff)
-                } else {
-                    log::debug!("Client {} read_line() returns {:?}", self.id, &buff);
-                    ClientResult::Last(buff)
+                let mut new_buff: Vec<u8> = Vec::new();
+                std::mem::swap(&mut self.buff, &mut new_buff);
+
+                // The spec says that all incoming text should be ASCII, but
+                // we're going to be defensive here anyway.
+                let mut line: String = match String::from_utf8(new_buff) {
+                    Ok(line) => line,
+                    Err(e) => {
+                        log::warn!(
+                            "Client {} rec'd non-UTF-8 input; returning approximation.",
+                            self.id
+                        );
+                        // We need the `.into()` because this function
+                        // returns a `Cow`, and we want to be sure we have
+                        // a `String`.
+                        String::from_utf8_lossy(&e.into_bytes()).into()
+                    }
+                };
+
+                // This unwrapping is okay because we've read at least one
+                // byte into `self.buff`.
+                if *line.as_bytes().last().unwrap() != b'\n' {
+                    // This might happen if this is the last line from the
+                    // client. We'll add the newline because the function of
+                    // the rest of the program depends on it.
+                    line.push('\n');
                 }
+                log::debug!("Client {} read_line() returns {:?}", self.id, &line);
+                ClientResult::Line(line)
             },
             Err(e) => ClientResult::Err(format!("{}", &e)),
         }
     }
 
+    /// Attempt to write a message to the socket.
     pub async fn write(&mut self, chunk: &[u8]) -> Result<(), ()> {
         log::trace!(
-            "Client {} attempting to write {:?}",
+            "Client {} attempting to write: {:?}",
             self.id, String::from_utf8_lossy(chunk)
         );
-        if let Err(e) = self.sndr.write_all(chunk).await {
+        if let Err(e) = self.blow.write_all(chunk).await {
             log::error!(
                 "Client {}: error writing to socket: {}", self.id, &e
             );
@@ -163,7 +196,7 @@ impl Client {
     }
 
     pub async fn shutdown(self) {
-        let mut sock: TcpStream = self.rcvr.into_inner().unsplit(self.sndr);
+        let mut sock = self.suck.into_inner().unsplit(self.blow);
         if let Err(e) = sock.shutdown().await {
             log::error!("Client {}: error shutting down socket: {}", self.id, &e);
         }
@@ -171,6 +204,8 @@ impl Client {
     }
 }
 
+/// Ensure a new client's name conforms to the requirements: A nonzero number
+/// of only alphanumeric characters.
 fn name_ok(name: &str) -> bool {
     if name.is_empty() { return false; }
 
@@ -181,6 +216,9 @@ fn name_ok(name: &str) -> bool {
     return true;
 }
 
+/// Interact with the client.
+/// 
+/// This should be run in its own async task.
 async fn run_client(
     mut client: Client,
     mut recv: broadcast::Receiver<Msg>,
@@ -201,6 +239,8 @@ async fn run_client(
         }
 
         // Empty the channel, in case any messages leaked in prior to the join.
+        // This is kind of a hack, but I can't think of better way to do this
+        // that isn't unnecessarily labyrinthine.
         while let Ok(_) = recv.try_recv() { /* do bupkis */ }
 
         let evt = Evt::Arrive{ id: client.id, name };
@@ -217,12 +257,6 @@ async fn run_client(
                 ClientResult::Line(line) => {
                     let evt = Evt::Text{ id: client.id, text: line };
                     send.send(evt).await.unwrap();
-                },
-                ClientResult::Last(mut line) => {
-                    line.push('\n');
-                    let evt = Evt::Text{ id: client.id, text: line };
-                    send.send(evt).await.unwrap();
-                    break;
                 },
                 ClientResult::Eof => { break; },
                 ClientResult::Err(e) => {

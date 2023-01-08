@@ -34,8 +34,8 @@ impl Primes {
         Self { known }
     }
 
-    // The element of `self.known` *must* exceed `sqrt_n_sup` before calling.
-    // `sqrt_n_sup` must be equal to or greater than `sqrt(n). 
+    // The last element of `self.known` *must* exceed `sqrt_n_sup` before
+    // calling. `sqrt_n_sup` must be equal to or greater than `sqrt(n). 
     fn check(&self, n: u64, sqrt_n_sup: u64) -> bool {
         for &p in self.known.iter() {
             if p > sqrt_n_sup {
@@ -46,7 +46,8 @@ impl Primes {
                 return false;
             }
         }
-        // We shouldn't ever get here, but just in case.
+        // For maximum Rustiness, we should panic! here, instead of silently
+        // returning success.
         return true
     }
 
