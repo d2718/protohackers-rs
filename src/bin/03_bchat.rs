@@ -99,7 +99,7 @@ impl Room {
                 Evt::Leave(id) => {
                     let name = self.users.remove(&id).unwrap();
                     let msg = Msg::All {
-                        text: format!("* {} leaves.", &name),
+                        text: format!("* {} leaves.\n", &name),
                         id: id,
                     };
                     // If no one is left in the `Room`, this will return an
@@ -136,6 +136,18 @@ impl Client {
             blow: w,
             buff: Vec::new(),
         }
+    }
+
+    /// Ensure a new client's name conforms to the requirements: A nonzero number
+    /// of only alphanumeric characters.
+    fn name_ok(name: &str) -> bool {
+        if name.is_empty() { return false; }
+
+        for c in name.chars() {
+            if !c.is_alphanumeric() { return false; }
+        }
+
+        return true;
     }
 
     /// Attempt to read a single line of text from the socket.
@@ -202,96 +214,93 @@ impl Client {
         }
         log::info!("Client {} disconnects.", self.id);
     }
-}
 
-/// Ensure a new client's name conforms to the requirements: A nonzero number
-/// of only alphanumeric characters.
-fn name_ok(name: &str) -> bool {
-    if name.is_empty() { return false; }
+    /// Interact with the client.
+    /// 
+    /// This should be run in its own async task.
+    pub async fn run(
+        mut self,
+        mut recv: broadcast::Receiver<Msg>,
+        send: mpsc::Sender<Evt>
+    ) {
+        if self.write(WELCOME_TEXT).await.is_err() {
+           self.shutdown().await;
+           return;
+        }
+        
+        if let ClientResult::Line(name) = self.get_line().await {
+            let name = name.trim().to_string();
+            if !Client::name_ok(&name) {
+                log::info!("Client {} attempts bad name: {:?}", self.id, &name);
+                let _ = self.write(REJECT_TEXT).await;
+                self.shutdown().await;
+                return;
+            }
 
-    for c in name.chars() {
-        if !c.is_alphanumeric() { return false; }
-    }
+            // Empty the channel, in case any messages leaked in prior to the
+            // join. This is kind of a hack, but I can't think of better way
+            // to do this that isn't unnecessarily labyrinthine.
+            while let Ok(_) = recv.try_recv() { /* do bupkis */ }
 
-    return true;
-}
-
-/// Interact with the client.
-/// 
-/// This should be run in its own async task.
-async fn run_client(
-    mut client: Client,
-    mut recv: broadcast::Receiver<Msg>,
-    send: mpsc::Sender<Evt>
-) {
-    if client.write(WELCOME_TEXT).await.is_err() {
-        client.shutdown().await;
-        return;
-    }
-    
-    if let ClientResult::Line(name) = client.get_line().await {
-        let name = name.trim().to_string();
-        if !name_ok(&name) {
-            log::info!("Client {} attempts bad name: {:?}", client.id, &name);
-            let _ = client.write(REJECT_TEXT).await;
-            client.shutdown().await;
+            let evt = Evt::Arrive{ id: self.id, name };
+            send.send(evt).await.unwrap();
+        } else {
+            log::error!(
+                "Error receiving a name message from Client {}.",
+                self.id
+            );
+            self.shutdown().await;
             return;
         }
 
-        // Empty the channel, in case any messages leaked in prior to the join.
-        // This is kind of a hack, but I can't think of better way to do this
-        // that isn't unnecessarily labyrinthine.
-        while let Ok(_) = recv.try_recv() { /* do bupkis */ }
-
-        let evt = Evt::Arrive{ id: client.id, name };
-        send.send(evt).await.unwrap();
-    } else {
-        log::error!("Error receiving a name message from Client {}.", client.id);
-        client.shutdown().await;
-        return;
-    }
-
-    loop {
-        tokio::select!{
-            res = client.get_line() => match res {
-                ClientResult::Line(line) => {
-                    let evt = Evt::Text{ id: client.id, text: line };
-                    send.send(evt).await.unwrap();
-                },
-                ClientResult::Eof => { break; },
-                ClientResult::Err(e) => {
-                    log::error!("Error reading from client {} socket: {}", client.id, &e);
-                    break;
-                }
-            },
-            res = recv.recv() => {
-                log::info!("Client {}: {:?}", client.id, &res);
-                match res {
-                    Ok(Msg::All{ id, text }) => {
-                        if id != client.id {
-                            if client.write(text.as_bytes()).await.is_err() { break; }
-                        }
+        loop {
+            tokio::select!{
+                res = self.get_line() => match res {
+                    ClientResult::Line(line) => {
+                        let evt = Evt::Text{ id: self.id, text: line };
+                        send.send(evt).await.unwrap();
                     },
-                    Ok(Msg::One{ id, text }) => {
-                        if id == client.id {
-                            if client.write(text.as_bytes()).await.is_err() { break; }
-                        }
-                    },
-                    Err(broadcast::error::RecvError::Closed) => {
-                        log::error!("Broadcast channel closed.");
+                    ClientResult::Eof => { break; },
+                    ClientResult::Err(e) => {
+                        log::error!(
+                            "Error reading from client {} socket: {}",
+                            self.id, &e
+                        );
                         break;
-                    },
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        log::warn!("Client {} has dropped messages.", client.id);
-                        if client.write(LAGGED_TEXT).await.is_err() { break; }
-                    },
+                    }
+                },
+                res = recv.recv() => {
+                    log::info!("Client {}: {:?}", self.id, &res);
+                    match res {
+                        Ok(Msg::All{ id, text }) => {
+                            if id != self.id {
+                                if self.write(text.as_bytes()).await.is_err() { break; }
+                            }
+                        },
+                        Ok(Msg::One{ id, text }) => {
+                            if id == self.id {
+                                if self.write(text.as_bytes()).await.is_err() { break; }
+                            }
+                        },
+                        Err(broadcast::error::RecvError::Closed) => {
+                            log::error!("Broadcast channel closed.");
+                            break;
+                        },
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            log::warn!(
+                                "Client {} has dropped messages.",
+                                self.id
+                            );
+                            if self.write(LAGGED_TEXT).await.is_err() { break; }
+                        },
+                    }
                 }
             }
         }
-    }
 
-    send.send(Evt::Leave(client.id)).await.unwrap();
-    client.shutdown().await;
+        send.send(Evt::Leave(self.id)).await.unwrap();
+        self.shutdown().await;
+    }
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -314,7 +323,7 @@ async fn main() {
                 client_n += 1;
                 let (bcast_tr, evt_tx) = (bcast_tx.subscribe(), evt_tx.clone());
                 tokio::spawn(async move { 
-                    run_client(client, bcast_tr, evt_tx).await;
+                    client.run(bcast_tr, evt_tx).await;
                 });
             },
             Err(e) => {
