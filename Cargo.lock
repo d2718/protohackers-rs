@@ -229,6 +229,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "lua-patterns"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f3da90ef01f4466adefe593c05d534fe270d04a2b067608cf8b230123e5a281"
+
+[[package]]
 name = "memchr"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -259,6 +265,7 @@ dependencies = [
  "env_logger",
  "futures",
  "log",
+ "lua-patterns",
  "once_cell",
  "serde",
  "serde_json",
